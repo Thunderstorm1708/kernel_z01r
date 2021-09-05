@@ -64,7 +64,7 @@ static noinline int __cpuidle cpu_idle_poll(void)
 	local_irq_enable();
 	stop_critical_timings();
 	while (!tif_need_resched() &&
-		(cpu_idle_force_poll || tick_check_broadcast_expired()))
+		(cpu_idle_force_poll || tick_check_broadcast_expired() || is_reserved(smp_processor_id())))
 		cpu_relax();
 	start_critical_timings();
 	trace_cpu_idle_rcuidle(PWR_EVENT_EXIT, smp_processor_id());
@@ -149,9 +149,11 @@ static void cpuidle_idle_call(void)
 	 * so no more rcu read side critical sections and one more
 	 * step to the grace period
 	 */
-	rcu_idle_enter();
 
 	if (cpuidle_not_available(drv, dev)) {
+		tick_nohz_idle_stop_tick();
+		rcu_idle_enter();
+		
 		default_idle_call();
 		goto exit_idle;
 	}
@@ -166,20 +168,37 @@ static void cpuidle_idle_call(void)
 	 * until a proper wakeup interrupt happens.
 	 */
 	if (idle_should_freeze()) {
+		rcu_idle_enter();
+		
 		entered_state = cpuidle_enter_freeze(drv, dev);
 		if (entered_state > 0) {
 			local_irq_enable();
 			goto exit_idle;
 		}
+		
+		rcu_idle_exit();
 
+		tick_nohz_idle_stop_tick();
+		rcu_idle_enter();
+		
 		next_state = cpuidle_find_deepest_state(drv, dev);
 		call_cpuidle(drv, dev, next_state);
 	} else {
+		bool stop_tick = true;
+		
 		/*
 		 * Ask the cpuidle framework to choose a convenient idle state.
 		 */
-		next_state = cpuidle_select(drv, dev);
+		next_state = cpuidle_select(drv, dev, &stop_tick);
 		entered_state = call_cpuidle(drv, dev, next_state);
+		
+		if (stop_tick)
+			tick_nohz_idle_stop_tick();
+		else
+			tick_nohz_idle_retain_tick();
+
+		rcu_idle_enter();
+		
 		/*
 		 * Give the governor an opportunity to reflect on the outcome
 		 */
@@ -218,7 +237,6 @@ static void cpu_idle_loop(void)
 		 */
 
 		__current_set_polling();
-		quiet_vmstat();
 		tick_nohz_idle_enter();
 
 		while (!need_resched()) {
@@ -226,6 +244,7 @@ static void cpu_idle_loop(void)
 			rmb();
 
 			if (cpu_is_offline(cpu)) {
+				tick_nohz_idle_stop_tick_protected();
 				cpuhp_report_idle_dead();
 				arch_cpu_idle_dead();
 			}
@@ -242,11 +261,13 @@ static void cpu_idle_loop(void)
 			 * know that the IPI is going to arrive right
 			 * away
 			 */
-			if (cpu_idle_force_poll || tick_check_broadcast_expired())
+			if (cpu_idle_force_poll || tick_check_broadcast_expired() ||
+					is_reserved(cpu)) {
+				tick_nohz_idle_restart_tick();
 				cpu_idle_poll();
-			else
+			} else {
 				cpuidle_idle_call();
-
+			}
 			arch_cpu_idle_exit();
 		}
 
@@ -280,6 +301,57 @@ bool cpu_in_idle(unsigned long pc)
 	return pc >= (unsigned long)__cpuidle_text_start &&
 		pc < (unsigned long)__cpuidle_text_end;
 }
+
+struct idle_timer {
+	struct hrtimer timer;
+	int done;
+};
+
+static enum hrtimer_restart idle_inject_timer_fn(struct hrtimer *timer)
+{
+	struct idle_timer *it = container_of(timer, struct idle_timer, timer);
+
+	WRITE_ONCE(it->done, 1);
+	set_tsk_need_resched(current);
+
+	return HRTIMER_NORESTART;
+}
+
+void play_idle(unsigned long duration_us)
+{
+	struct idle_timer it;
+
+	/*
+	 * Only FIFO tasks can disable the tick since they don't need the forced
+	 * preemption.
+	 */
+	WARN_ON_ONCE(current->policy != SCHED_FIFO);
+	WARN_ON_ONCE(current->nr_cpus_allowed != 1);
+	WARN_ON_ONCE(!(current->flags & PF_KTHREAD));
+	WARN_ON_ONCE(!(current->flags & PF_NO_SETAFFINITY));
+	WARN_ON_ONCE(!duration_us);
+
+	rcu_sleep_check();
+	preempt_disable();
+	current->flags |= PF_WAKE_UP_IDLE;
+	cpuidle_use_deepest_state(true);
+
+	it.done = 0;
+	hrtimer_init_on_stack(&it.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	it.timer.function = idle_inject_timer_fn;
+	hrtimer_start(&it.timer, ns_to_ktime(duration_us * NSEC_PER_USEC),
+		      HRTIMER_MODE_REL_PINNED);
+
+	while (!READ_ONCE(it.done))
+		cpu_idle_loop();
+
+	cpuidle_use_deepest_state(false);
+	current->flags &= ~PF_WAKE_UP_IDLE;
+
+	preempt_fold_need_resched();
+	preempt_enable();
+}
+EXPORT_SYMBOL_GPL(play_idle);
 
 void cpu_startup_entry(enum cpuhp_state state)
 {

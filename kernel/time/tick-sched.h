@@ -2,6 +2,7 @@
 #define _TICK_SCHED_H
 
 #include <linux/hrtimer.h>
+#include <linux/tick.h>
 
 enum tick_device_mode {
 	TICKDEV_MODE_PERIODIC,
@@ -44,6 +45,7 @@ struct tick_sched {
 	unsigned long			check_clocks;
 	enum tick_nohz_mode		nohz_mode;
 	ktime_t				last_tick;
+	ktime_t				next_tick;
 	int				inidle;
 	int				tick_stopped;
 	unsigned long			idle_jiffies;
@@ -57,10 +59,13 @@ struct tick_sched {
 	ktime_t				iowait_sleeptime;
 	ktime_t				sleep_length;
 	unsigned long			last_jiffies;
+	u64				timer_expires;
+	u64				timer_expires_base;
 	u64				next_timer;
 	ktime_t				idle_expires;
 	int				do_timer_last;
 	atomic_t			tick_dep_mask;
+	unsigned int			got_idle_tick	: 1;
 };
 
 extern struct tick_sched *tick_get_tick_sched(int cpu);

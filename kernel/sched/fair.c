@@ -104,7 +104,7 @@ unsigned int sysctl_sched_use_walt_task_util = 1;
  * SCHED_TUNABLESCALING_LINEAR - scaled linear, *ncpus
  */
 enum sched_tunable_scaling sysctl_sched_tunable_scaling
-	= SCHED_TUNABLESCALING_LOG;
+	= SCHED_TUNABLESCALING_LINEAR;
 
 /*
  * Minimal preemption granularity for CPU-bound tasks:
@@ -3228,15 +3228,20 @@ static inline int test_and_clear_tg_cfs_propagate(struct sched_entity *se)
 static inline int propagate_entity_load_avg(struct sched_entity *se)
 {
 	struct cfs_rq *cfs_rq;
+	struct rq *rq;
 
 	if (entity_is_task(se))
 		return 0;
 
 	if (!test_and_clear_tg_cfs_propagate(se))
 		return 0;
-
+	
 	cfs_rq = cfs_rq_of(se);
+	rq = rq_of(cfs_rq);
 
+	if (!READ_ONCE(rq->avg_thermal.load_avg))
+		return 0;
+		
 	set_tg_cfs_propagate(cfs_rq);
 
 	update_tg_cfs_util(cfs_rq, se);
@@ -3349,7 +3354,9 @@ static inline int
 update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq, bool update_freq)
 {
 	struct sched_avg *sa = &cfs_rq->avg;
+	struct rq *rq = rq_of(cfs_rq);
 	int decayed, removed_load = 0, removed_util = 0;
+	unsigned long thermal_pressure;
 
 	if (atomic_long_read(&cfs_rq->removed_load_avg)) {
 		s64 r = atomic_long_xchg(&cfs_rq->removed_load_avg, 0);
@@ -3367,8 +3374,10 @@ update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq, bool update_freq)
 		set_tg_cfs_propagate(cfs_rq);
 	}
 
+	thermal_pressure = arch_scale_thermal_pressure(cpu_of(rq));
 	decayed = __update_load_avg(now, cpu_of(rq_of(cfs_rq)), sa,
-		scale_load_down(cfs_rq->load.weight), cfs_rq->curr != NULL, cfs_rq);
+		scale_load_down(cfs_rq->load.weight), cfs_rq->curr != NULL, cfs_rq) |
+		 update_thermal_load_avg(rq_clock_task(rq), rq, thermal_pressure);
 
 #ifndef CONFIG_64BIT
 	smp_wmb();
@@ -3423,6 +3432,38 @@ static inline void update_load_avg(struct sched_entity *se, int flags)
 #endif
 		trace_sched_load_avg_task(task_of(se), &se->avg, ptr);
 	}
+}
+
+/*
+ * thermal:
+ *
+ *   load_sum = \Sum se->avg.load_sum but se->avg.load_sum is not tracked
+ *
+ *   util_avg and runnable_load_avg are not supported and meaningless.
+ *
+ * Unlike rt/dl utilization tracking that track time spent by a cpu
+ * running a rt/dl task through util_avg, the average thermal pressure is
+ * tracked through load_avg. This is because thermal pressure signal is
+ * time weighted "delta" capacity unlike util_avg which is binary.
+ * "delta capacity" =  actual capacity  -
+ *			capped capacity a cpu due to a thermal event.
+ */
+
+int update_thermal_load_avg(u64 now, struct rq *rq, u64 capacity)
+{
+	int cpu = cpu_of(rq);
+
+	if (__update_load_avg(now, cpu, &rq->avg_thermal,
+			       capacity,
+			       capacity,
+			       NULL)) {
+		__update_load_avg(now, cpu, &rq->avg_thermal,
+			  1, 0, NULL);
+
+		return 1;
+	}
+
+	return 0;
 }
 
 /**
@@ -6407,12 +6448,20 @@ boosted_cpu_util(int cpu, struct sched_walt_cpu_load *walt_load)
 static inline unsigned long
 boosted_task_util(struct task_struct *p)
 {
+#ifdef CONFIG_UCLAMP_TASK_GROUP
+	unsigned long util = task_util(p);
+	unsigned long util_min = uclamp_eff_value(p, UCLAMP_MIN);
+	unsigned long util_max = uclamp_eff_value(p, UCLAMP_MAX);
+
+	return clamp(util, util_min, util_max);
+#else
 	unsigned long util = task_util(p);
 	long margin = schedtune_task_margin(p);
 
 	trace_sched_boost_task(p, util, margin);
 
 	return util + margin;
+#endif
 }
 
 static unsigned long capacity_spare_wake(int cpu, struct task_struct *p)
@@ -7126,6 +7175,10 @@ retry:
 
 			if (walt_cpu_high_irqload(i) || is_reserved(i))
 				continue;
+				
+			/* Skip CPUs which do not fit task requirements */
+			if (capacity_of(i) < boosted_task_util(p))
+				continue;
 
 			/*
 			 * p's blocked utilization is still accounted for on prev_cpu
@@ -7588,6 +7641,9 @@ static int select_energy_cpu_brute(struct task_struct *p, int prev_cpu, int sync
 #ifdef CONFIG_CGROUP_SCHEDTUNE
 	boosted = schedtune_task_boost(p) > 0;
 	prefer_idle = schedtune_prefer_idle(p) > 0;
+#elif  CONFIG_UCLAMP_TASK
+	boosted = uclamp_boosted(p);
+	prefer_idle = uclamp_latency_sensitive(p);
 #else
 	boosted = get_sysctl_sched_cfs_boost() > 0;
 	prefer_idle = 0;
@@ -9003,6 +9059,7 @@ static unsigned long scale_rt_capacity(int cpu)
 	total = sched_avg_period() + delta;
 
 	used = div_u64(avg, total);
+	used += READ_ONCE(rq->avg_thermal.load_avg);
 
 	if (likely(used < SCHED_CAPACITY_SCALE))
 		return SCHED_CAPACITY_SCALE - used;
@@ -10072,6 +10129,14 @@ static struct rq *find_busiest_queue(struct lb_env *env,
 			busiest_capacity = capacity;
 			busiest = rq;
 		}
+		
+		/*
+		 * Don't try to pull utilization from a CPU with one
+		 * running task. Whatever its utilization, we will fail
+		 * detach the task.
+		 */
+		if (rq->nr_running <= 1)
+			continue;
 	}
 
 	return busiest;
@@ -11810,6 +11875,10 @@ const struct sched_class fair_sched_class = {
 	.fixup_cumulative_runnable_avg =
 		walt_fixup_cumulative_runnable_avg_fair,
 #endif
+
+#ifdef CONFIG_UCLAMP_TASK
+	.uclamp_enabled		= 1,
+#endif
 };
 
 #ifdef CONFIG_SCHED_DEBUG
@@ -12174,7 +12243,7 @@ static DEFINE_RAW_SPINLOCK(migration_lock);
 void check_for_migration(struct rq *rq, struct task_struct *p)
 {
 	int new_cpu;
-	int active_balance;
+	int active_balance, ret;
 	int cpu = task_cpu(p);
 
 	if (rq->misfit_task) {
@@ -12194,9 +12263,13 @@ void check_for_migration(struct rq *rq, struct task_struct *p)
 			if (active_balance) {
 				mark_reserved(new_cpu);
 				raw_spin_unlock(&migration_lock);
-				stop_one_cpu_nowait(cpu,
+				ret = stop_one_cpu_nowait(cpu,
 					active_load_balance_cpu_stop, rq,
 					&rq->active_balance_work);
+				if (!ret)
+					clear_reserved(new_cpu);
+				else
+					wake_up_if_idle(new_cpu);
 				return;
 			}
 		} else {

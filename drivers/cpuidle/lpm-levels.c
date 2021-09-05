@@ -459,7 +459,7 @@ static uint64_t lpm_cpuidle_predict(struct cpuidle_device *dev,
 		history->hinvalid = 0;
 		history->htmr_wkup = 1;
 		history->stime = 0;
-		return 0;
+		return 1;
 	}
 
 	/*
@@ -643,7 +643,7 @@ static int cpu_power_select(struct cpuidle_device *dev,
 
 		lvl_latency_us = pwr_params->latency_us;
 
-		if (latency_us < lvl_latency_us)
+		if (latency_us <= lvl_latency_us)
 			break;
 
 		if (next_event_us) {
@@ -662,8 +662,10 @@ static int cpu_power_select(struct cpuidle_device *dev,
 			 * call prediction.
 			 */
 			if (next_wakeup_us > max_residency[i]) {
-				predicted = lpm_cpuidle_predict(dev, cpu,
-					&idx_restrict, &idx_restrict_time);
+				predicted = (lpm_cpuidle_predict(dev, cpu,
+					&idx_restrict,
+					&idx_restrict_time) == 1) ? 0 :
+						(max_residency[i] >> 1);
 				if (predicted && (predicted < min_residency[i]))
 					predicted = min_residency[i];
 			} else
@@ -980,7 +982,7 @@ static int cluster_select(struct lpm_cluster *cluster, bool from_idle,
 					&level->num_cpu_votes))
 			continue;
 
-		if (from_idle && latency_us < pwr_params->latency_us)
+		if (from_idle && latency_us <= pwr_params->latency_us)
 			break;
 
 		if (sleep_us < pwr_params->time_overhead_us)
@@ -1356,7 +1358,7 @@ static bool psci_enter_sleep(struct lpm_cpu *cpu, int idx, bool from_idle)
 }
 
 static int lpm_cpuidle_select(struct cpuidle_driver *drv,
-		struct cpuidle_device *dev)
+		struct cpuidle_device *dev, bool *stop_tick)
 {
 	struct lpm_cpu *cpu = per_cpu(cpu_lpm, dev->cpu);
 
@@ -1509,7 +1511,6 @@ static struct cpuidle_governor lpm_governor = {
 	.name =		"qcom",
 	.rating =	30,
 	.select =	lpm_cpuidle_select,
-	.owner =	THIS_MODULE,
 };
 
 static int cluster_cpuidle_register(struct lpm_cluster *cl)
@@ -1743,8 +1744,7 @@ static int lpm_probe(struct platform_device *pdev)
 	cluster_timer_init(lpm_root_node);
 
 	size = num_dbg_elements * sizeof(struct lpm_debug);
-	lpm_debug = dma_alloc_coherent(&pdev->dev, size,
-			&lpm_debug_phys, GFP_KERNEL);
+	lpm_debug = NULL;
 
 	register_cluster_lpm_stats(lpm_root_node, NULL);
 

@@ -12,7 +12,6 @@
 
 #include <linux/kernel.h>
 #include <linux/cpuidle.h>
-#include <linux/pm_qos.h>
 #include <linux/time.h>
 #include <linux/ktime.h>
 #include <linux/hrtimer.h>
@@ -20,7 +19,6 @@
 #include <linux/sched.h>
 #include <linux/sched/loadavg.h>
 #include <linux/math64.h>
-#include <linux/module.h>
 
 /*
  * Please note when changing the tuning values:
@@ -120,7 +118,6 @@
  */
 
 struct menu_device {
-	int		last_state_idx;
 	int             needs_update;
 
 	unsigned int	next_timer_us;
@@ -283,11 +280,12 @@ again:
 static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 {
 	struct menu_device *data = this_cpu_ptr(&menu_devices);
-	int latency_req = pm_qos_request(PM_QOS_CPU_DMA_LATENCY);
+	int latency_req = cpuidle_governor_latency_req(dev->cpu);
 	int i;
 	unsigned int interactivity_req;
 	unsigned int expected_interval;
 	unsigned long nr_iowaiters, cpu_load;
+	ktime_t delta_next;
 
 	if (data->needs_update) {
 		menu_update(drv, dev);
@@ -329,11 +327,11 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 		if (data->next_timer_us > polling_threshold &&
 		    latency_req > s->exit_latency && !s->disabled &&
 		    !dev->states_usage[CPUIDLE_DRIVER_STATE_START].disable)
-			data->last_state_idx = CPUIDLE_DRIVER_STATE_START;
+			dev->last_state_idx = CPUIDLE_DRIVER_STATE_START;
 		else
-			data->last_state_idx = CPUIDLE_DRIVER_STATE_START - 1;
+			dev->last_state_idx = CPUIDLE_DRIVER_STATE_START - 1;
 	} else {
-		data->last_state_idx = CPUIDLE_DRIVER_STATE_START;
+		dev->last_state_idx = CPUIDLE_DRIVER_STATE_START;
 	}
 
 	/*
@@ -353,7 +351,7 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 	 * Find the idle state with the lowest power while satisfying
 	 * our constraints.
 	 */
-	for (i = data->last_state_idx + 1; i < drv->state_count; i++) {
+	for (i = dev->last_state_idx + 1; i < drv->state_count; i++) {
 		struct cpuidle_state *s = &drv->states[i];
 		struct cpuidle_state_usage *su = &dev->states_usage[i];
 
@@ -364,10 +362,10 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 		if (s->exit_latency > latency_req)
 			continue;
 
-		data->last_state_idx = i;
+		dev->last_state_idx = i;
 	}
 
-	return data->last_state_idx;
+	return dev->last_state_idx;
 }
 
 /**
@@ -382,7 +380,7 @@ static void menu_reflect(struct cpuidle_device *dev, int index)
 {
 	struct menu_device *data = this_cpu_ptr(&menu_devices);
 
-	data->last_state_idx = index;
+	dev->last_state_idx = index;
 	data->needs_update = 1;
 }
 
@@ -394,7 +392,7 @@ static void menu_reflect(struct cpuidle_device *dev, int index)
 static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 {
 	struct menu_device *data = this_cpu_ptr(&menu_devices);
-	int last_idx = data->last_state_idx;
+	int last_idx = dev->last_state_idx;
 	struct cpuidle_state *target = &drv->states[last_idx];
 	unsigned int measured_us;
 	unsigned int new_factor;
@@ -486,7 +484,6 @@ static struct cpuidle_governor menu_governor = {
 	.enable =	menu_enable_device,
 	.select =	menu_select,
 	.reflect =	menu_reflect,
-	.owner =	THIS_MODULE,
 };
 
 /**
