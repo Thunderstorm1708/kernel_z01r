@@ -160,7 +160,7 @@ static long amrnb_in_ioctl(struct file *file,
 		break;
 	}
 	case AUDIO_GET_AMRNB_ENC_CONFIG_V2: {
-		if (copy_to_user((void *)arg, audio->enc_cfg,
+			if (copy_to_user((void *)arg, audio->enc_cfg,
 			sizeof(struct msm_audio_amrnb_enc_config_v2))) {
 			pr_err("%s: copy_to_user for AUDIO_GET_AMRNB_ENC_CONFIG_V2 failed\n",
 				__func__);

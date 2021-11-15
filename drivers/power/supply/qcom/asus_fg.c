@@ -1072,7 +1072,7 @@ static int file_op(const char *filename, loff_t offset, char *buf, int length, i
 		rc = -2;
 		goto OUT;
 	}
-    else
+    	else
         pr_info("open %s success!\n", filename);
 
 	sys_lseek(filep, offset, SEEK_SET);

@@ -2605,7 +2605,7 @@ void asus_adapter_adc_process(struct asus_charger *asus_chg, bool is_rerun)
 
     // set usb icl 25mA
     rc = smblib_masked_write(chg, USBIN_CURRENT_LIMIT_CFG_REG, USBIN_CURRENT_LIMIT_MASK, 0x01);
-    if (rc < 0)
+    	if (rc < 0)
         CHG_DBG_E("%s: Failed to set USBIN_CURRENT_LIMIT_CFG_REG\n", __func__);
 
 	if (asp1690_ready != 1) {

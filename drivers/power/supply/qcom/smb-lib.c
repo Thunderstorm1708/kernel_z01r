@@ -4862,7 +4862,7 @@ static void smblib_handle_typec_cc_state_change(struct smb_charger *chg)
 	else
 		vote(chg->usb_icl_votable, OTG_VOTER, false, 0);
 
-    if (!chg->typec_present && chg->asus_chg->pon_cable_det_flag)
+    	if (!chg->typec_present && chg->asus_chg->pon_cable_det_flag)
         chg->asus_chg->pon_cable_det_flag =false;
 
 	smblib_dbg(chg, PR_INTERRUPT, "IRQ: cc-state-change; Type-C %s detected\n",

@@ -1057,7 +1057,7 @@ static irqreturn_t qbt1000_ipc_irq_handler(int irq, void *dev_id)
 
 					purge_finger_events(drvdata);
 
-					if (!kfifo_put(&drvdata->fw_events,
+						if (!kfifo_put(&drvdata->fw_events,
 							fw_ev_desc))
 						pr_err("fw events: fifo full");
 						pr_err(", drop event %d\n",
